@@ -12,12 +12,14 @@
 #define IRQ_CAMERA 0x08
 #define IRQ_LORA   0x10
 
-#define CMD_INVALID       0x00
-#define CMD_POWER_ENABLE  0x01
-#define CMD_POWER_DISABLE 0x02
-#define CMD_RESET_DEVICE  0x03
+#define CMD_INVALID        0x00
+#define CMD_POWER_ENABLE   0x01
+#define CMD_POWER_DISABLE  0x02
+#define CMD_RESET_DEVICE   0x03
+#define CMD_SPI_SELECT     0x04
+#define CMD_MBUS_BAUD_RATE 0x05
 
-#define DEVICE_INVALID 0x00
+#define DEVICE_NONE    0x00
 #define DEVICE_GPS     0x01
 #define DEVICE_MBUS    0x02
 #define DEVICE_CAMERA  0x03
@@ -31,8 +33,10 @@ uint8_t rButtons = 0x00;
 SoftwareSerial gpsSerial( GPS_DATA , -1 ); // RX only
 SoftwareSerial mbusSerial( MBUS_RX, MBUS_TX ); // RX and TX
 
-uint8_t mbusRxBuffer[256] = {0};
-uint8_t gpsBuffer[256] = {0};
+uint8_t mbusRxStorage[256] = {0};
+uint8_t gpsStorage[256] = {0};
+ByteBuffer mbusRxBuffer;
+ByteBuffer gpsBuffer;
 
 // Override any variant-provided initVariant() that might configure pins (e.g., LED_BUILTIN).
 extern "C" void initVariant(void)
@@ -82,11 +86,11 @@ void setup() {
 
   // GPS Serial Setup //
   gpsSerial.begin( 9600 );
-  buffer_init( gpsBuffer, sizeof(gpsBuffer) );
+  buffer_init( &gpsBuffer, gpsStorage, sizeof(gpsStorage) );
 
   // mBus Serial Setup //
-  //mbusSerial.begin( 9600 );
-  //buffer_init( mbusRxBuffer, sizeof(mbusRxBuffer) );
+  mbusSerial.begin( 9600 );
+  buffer_init( &mbusRxBuffer, mbusRxStorage, sizeof(mbusRxStorage) );
 
   // I2C Setup //
   Wire.begin( RIBBIT_ADDRESS );
@@ -111,13 +115,34 @@ void loop() {
   }
 
   if( gpsSerial.available() ) {
-    uint8_t gpsByte = gpsSerial.read();
-    buffer_push( gpsBuffer, sizeof(gpsBuffer), gpsByte );
-    
-    // Always flag IRQ on new data
-    digitalWrite( MBUS_INT, HIGH );
+    if( buffer_full( &gpsBuffer ) ) {
+      // Buffer overflow, start dropping data
+      buffer_pop( &gpsBuffer, nullptr );
+    }
 
-    rIRQ |= IRQ_GPS;
+    uint8_t gpsByte = gpsSerial.read();
+    buffer_push( &gpsBuffer, gpsByte );
+    
+    // Only signal IRQ when we have a complete line or significant data
+    //if( gpsByte == '\n' || buffer_size( &gpsBuffer ) >= 64 ) {
+      //digitalWrite( MBUS_INT, HIGH );
+      rIRQ |= IRQ_GPS;
+      digitalWrite( HOST_IRQ, LOW ); // Signal interrupt to host
+    //}
+  }
+
+  if(  mbusSerial.available() ) {
+    if( buffer_full( &mbusRxBuffer ) ) {
+      // Buffer overflow, start dropping data
+      buffer_pop( &mbusRxBuffer, nullptr );
+    }
+
+    uint8_t mbusByte = mbusSerial.read();
+    buffer_push( &mbusRxBuffer, mbusByte );
+    
+    // Only signal IRQ when we have a complete line or significant data
+    //digitalWrite( MBUS_INT, HIGH );
+    rIRQ |= IRQ_MBUS;
     digitalWrite( HOST_IRQ, LOW ); // Signal interrupt to host
   }
 }
@@ -135,8 +160,17 @@ void i2cRequest() {
   //
   // Returned frames should have their header IRQ set to a single
   // bit option, not a composite!
-  if( (rIRQ & IRQ_GPS) == IRQ_GPS ) {
-    uint8_t length = buffer_size( gpsBuffer, sizeof(gpsBuffer ) );
+  if( (rIRQ & IRQ_BUTTON) == IRQ_BUTTON ) {
+    uint8_t frame[16] = {
+      IRQ_BUTTON,
+      rButtons,
+      0x00
+    }; // Zero pad the remaining bytes
+    Wire.write( frame, sizeof(frame) );
+    rIRQ &= ~IRQ_BUTTON; // Clear button IRQ after read
+  }
+  else if( (rIRQ & IRQ_GPS) == IRQ_GPS ) {
+    uint8_t length = buffer_size( &gpsBuffer );
 
     if( length > 14 )
       length = 14; // Max data length we can send in one frame
@@ -147,42 +181,67 @@ void i2cRequest() {
     }; // Zero pad the remaining bytes
 
     for( size_t i = 0; i < length; i++ ) {
-      if( buffer_available( gpsBuffer, sizeof(gpsBuffer) ) ) {
-        frame[i + 2] = buffer_pop( gpsBuffer, sizeof(gpsBuffer) );
+      if( buffer_available( &gpsBuffer ) ) {
+        uint8_t value = 0;
+        buffer_pop( &gpsBuffer, &value );
+        frame[i + 2] = value;
       } else {
         frame[i + 2] = 0x00; // No more data
       }
     }
 
     Wire.write( frame, sizeof(frame) );
-    rIRQ &= ~IRQ_GPS; // Clear GPS IRQ after read
+
+    // Keep GPS IRQ asserted if more data remains so the host keeps reading.
+    if( buffer_available( &gpsBuffer ) ) {
+      rIRQ |= IRQ_GPS;
+      digitalWrite( HOST_IRQ, LOW );
+      //digitalWrite( MBUS_INT, HIGH );
+    } else {
+      rIRQ &= ~IRQ_GPS; // Clear GPS IRQ after read
+    }
   }
-  else if( (rIRQ & IRQ_BUTTON) == IRQ_BUTTON ) {
+  else if( (rIRQ & IRQ_MBUS) == IRQ_MBUS ) {
+    uint8_t length = buffer_size( &mbusRxBuffer );
+
+    if( length > 14 )
+      length = 14; // Max data length we can send in one frame
+
     uint8_t frame[16] = {
-      IRQ_BUTTON,
-      rButtons,
-      0x00
+      IRQ_MBUS,
+      length,
     }; // Zero pad the remaining bytes
+
+    for( size_t i = 0; i < length; i++ ) {
+      if( buffer_available( &mbusRxBuffer ) ) {
+        uint8_t value = 0;
+        buffer_pop( &mbusRxBuffer, &value );
+        frame[i + 2] = value;
+      } else {
+        frame[i + 2] = 0x00; // No more data
+      }
+    }
+
     Wire.write( frame, sizeof(frame) );
-    rIRQ &= ~IRQ_BUTTON; // Clear button IRQ after read
+
+    // Keep mBus IRQ asserted if more data remains so the host keeps reading.
+    if( buffer_available( &mbusRxBuffer ) ) {
+      rIRQ |= IRQ_MBUS;
+      digitalWrite( HOST_IRQ, LOW );
+      //digitalWrite( MBUS_INT, HIGH );
+    } else {
+      rIRQ &= ~IRQ_MBUS; // Clear mBus IRQ after read
+    }
   }
 
   // Only clear the IRQ lines if no other types are pending
   if( rIRQ == IRQ_NONE ) {
     digitalWrite( HOST_IRQ, HIGH ); // Clear interrupt signal
-    digitalWrite( MBUS_INT, LOW ); // Clear mBus interrupt signal
+    //digitalWrite( MBUS_INT, LOW ); // Clear mBus interrupt signal
   }
 }
 
 void i2cEvent( int length ) {
-  /*if( length < 2 ) {
-    // Not enough data to process command
-    return;
-  }*/
-
-  digitalWrite( MBUS_INT, HIGH );
-  digitalWrite( MBUS_RESET, LOW );
-
   uint8_t command = Wire.read();
   uint8_t target = Wire.read();
 
@@ -247,22 +306,48 @@ void i2cEvent( int length ) {
           break;
       }
       break;
+    
+    case CMD_SPI_SELECT:
+      switch( target ) {
+        case DEVICE_CAMERA:
+          digitalWrite( SD_SELECT, HIGH ); // Deselect SD
+          digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
+          digitalWrite( CAM_SELECT, LOW ); // Enable Camera
+          break;
+        
+        case DEVICE_SD:
+          digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
+          digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
+          digitalWrite( SD_SELECT, LOW ); // Select SD
+          break;
+        
+        case DEVICE_LORA:
+          digitalWrite( SD_SELECT, HIGH ); // Deselect SD
+          digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
+          digitalWrite( LORA_SELECT, LOW ); // Select LoRa
+          break;
+        
+        default:
+          // Invalid device
+          digitalWrite( SD_SELECT, HIGH ); // Deselect both
+          digitalWrite( LORA_SELECT, HIGH );
+          digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
+          break;
+      }
+      break;
+    
+    case CMD_MBUS_BAUD_RATE:
+      if( target < sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]) ) {
+        uint32_t baudRate = BAUD_RATES[target];
+        mbusSerial.end();
+        mbusSerial.begin( baudRate );
+      }
+      break;
+
 
     // Invalid command
     default:
-      digitalWrite( MBUS_RESET, HIGH );
       break;
   }
 
-  delay( 10 );
-  digitalWrite( MBUS_INT, LOW );
-
-  /*while ( Wire.available() ) {
-    uint8_t receivedByte = Wire.read();
-    if ( receivedByte == 0x01 ) {
-      digitalWrite( MBUS_EN, HIGH );
-    } else if ( receivedByte == 0x00 ) {
-      digitalWrite( MBUS_EN, LOW );
-    }
-  }*/
 }

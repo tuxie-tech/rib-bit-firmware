@@ -59,3 +59,23 @@
 #define RIBBIT_VERSION_STR "1.0"
 #define RIBBIT_VERSION_MAJOR 1
 #define RIBBIT_VERSION_MINOR 0
+
+// Common UART Baud Rates
+static const uint32_t BAUD_RATES[] = {
+    300,
+    600,
+    1200,
+    2400,
+    4800,
+    9600,
+    14400,
+    19200,
+    28800,
+    38400,
+    57600,
+    115200,
+    230400,
+    460800,
+    921600
+};
+static const size_t BAUD_RATES_COUNT = sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]);
