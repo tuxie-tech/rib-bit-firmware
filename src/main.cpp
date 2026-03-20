@@ -12,23 +12,29 @@
 #define IRQ_CAMERA 0x08
 #define IRQ_LORA   0x10
 
-#define CMD_INVALID        0x00
-#define CMD_POWER_ENABLE   0x01
-#define CMD_POWER_DISABLE  0x02
-#define CMD_RESET_DEVICE   0x03
-#define CMD_SPI_SELECT     0x04
-#define CMD_MBUS_BAUD_RATE 0x05
+// Effectively 'registers' on the host's side.
+#define CMD_INVALID         0x00
+#define CMD_POWER_ENABLE    0x01
+#define CMD_POWER_DISABLE   0x02
+#define CMD_RESET_DEVICE    0x03
+#define CMD_SPI_SELECT      0x04
+#define CMD_MBUS_BAUD_RATE  0x05
+#define CMD_SERIAL_WRITE    0x06
+#define CMD_REGISTER_WRITE  0x07
 
-#define DEVICE_NONE    0x00
-#define DEVICE_GPS     0x01
-#define DEVICE_MBUS    0x02
-#define DEVICE_CAMERA  0x03
-#define DEVICE_LORA    0x04
-#define DEVICE_SD      0x05
+#define DEVICE_NONE      0x00
+#define DEVICE_GPS       0x01
+#define DEVICE_MBUS      0x02
+#define DEVICE_CAMERA    0x03
+#define DEVICE_LORA      0x04
+#define DEVICE_LORA_TXRX 0x05
+#define DEVICE_SD        0x06
+// -- gap -- //
+#define DEVICE_VERSION    0xff
 
 // System State (virtual registers)
-uint8_t rIRQ = 0x00;
-uint8_t rButtons = 0x00;
+static volatile uint8_t rIRQ = 0x00;
+static volatile uint8_t rButtons = 0x00;
 
 SoftwareSerial gpsSerial( GPS_DATA , -1 ); // RX only
 SoftwareSerial mbusSerial( MBUS_RX, MBUS_TX ); // RX and TX
@@ -37,6 +43,10 @@ uint8_t mbusRxStorage[256] = {0};
 uint8_t gpsStorage[256] = {0};
 ByteBuffer mbusRxBuffer;
 ByteBuffer gpsBuffer;
+
+static volatile uint8_t TEST_REG_VALUE = 0;
+static volatile uint8_t pending_reg = 0;
+static volatile bool deferred_reg_read = false;
 
 // Override any variant-provided initVariant() that might configure pins (e.g., LED_BUILTIN).
 extern "C" void initVariant(void)
@@ -69,6 +79,9 @@ void setup() {
 
   pinMode( LORA_SELECT, OUTPUT );
   digitalWrite( LORA_SELECT, HIGH );
+
+  // Bidirectional TXRX pin for LoRa, default to input (RX mode, high-z)
+  pinMode( LORA_TXRX, INPUT );
 
   // Digital IO //
   pinMode( SW_0, INPUT );
@@ -131,7 +144,7 @@ void loop() {
     //}
   }
 
-  if(  mbusSerial.available() ) {
+  if( mbusSerial.available() ) {
     if( buffer_full( &mbusRxBuffer ) ) {
       // Buffer overflow, start dropping data
       buffer_pop( &mbusRxBuffer, nullptr );
@@ -145,9 +158,35 @@ void loop() {
     rIRQ |= IRQ_MBUS;
     digitalWrite( HOST_IRQ, LOW ); // Signal interrupt to host
   }
+
+  delay(2);
 }
 
 void i2cRequest() {
+
+  // Handle deferred register read if pending.
+  // This allows us to do pin/register reads in the context of the request.
+  if( deferred_reg_read ) {
+    deferred_reg_read = false;
+    uint8_t value = 0x00;
+    switch( pending_reg ) {
+      case DEVICE_NONE:
+        value = TEST_REG_VALUE;
+        break;
+        
+      case DEVICE_LORA_TXRX:
+        pinMode( LORA_TXRX, INPUT );
+        value = digitalRead( LORA_TXRX );
+        break;
+      
+      case DEVICE_VERSION:
+        value = RIBBIT_VERSION;
+        break;
+    }
+
+    Wire.write( value );
+    return;
+  }
 
   if( rIRQ == IRQ_NONE ) {
     uint8_t frame[16] = {0};
@@ -196,7 +235,7 @@ void i2cRequest() {
     if( buffer_available( &gpsBuffer ) ) {
       rIRQ |= IRQ_GPS;
       digitalWrite( HOST_IRQ, LOW );
-      //digitalWrite( MBUS_INT, HIGH );
+      //digitalWrite( MBUS_INT, HIGH ); // Debug
     } else {
       rIRQ &= ~IRQ_GPS; // Clear GPS IRQ after read
     }
@@ -243,111 +282,166 @@ void i2cRequest() {
 
 void i2cEvent( int length ) {
   uint8_t command = Wire.read();
+
+  // 1-byte commands are just a pin read, and we only currently have 1 pin
+  //
+  // This is a little bit of a hack to reuse the device IDs as pin selectors for
+  // single simple read commands, a-la regular registre reads.
+  if( length == 1 ) {
+    pending_reg = command;
+    deferred_reg_read = true;
+    return;
+  }
+
+  // All other commands should have at least 2 bytes (command + target)
   uint8_t target = Wire.read();
 
-  switch( command ) {
+  // 2-byte commands are configuration commands, so handle those first.
+  if( length == 2 ) {
+    switch( command ) {
 
-    // Enable power to peripheral
-    case CMD_POWER_ENABLE:
-      switch( target ) {
-        case DEVICE_GPS:
-          digitalWrite( GPS_EN, HIGH );
-          break;
-        case DEVICE_MBUS:
-          digitalWrite( MBUS_EN, HIGH );
-          break;
-        case DEVICE_CAMERA:
-          digitalWrite( CAM_EN, HIGH );
-          break;
-        default:
-          // Invalid device
-          break;
-      }
-      break;
+      // Enable power to peripheral
+      case CMD_POWER_ENABLE:
+        switch( target ) {
+          case DEVICE_GPS:
+            digitalWrite( GPS_EN, HIGH );
+            break;
+          case DEVICE_MBUS:
+            digitalWrite( MBUS_EN, HIGH );
+            break;
+          case DEVICE_CAMERA:
+            digitalWrite( CAM_EN, HIGH );
+            break;
+          default:
+            // Invalid device
+            break;
+        }
+        break;
 
-    // Disable power to peripheral
-    case CMD_POWER_DISABLE:
-      switch( target ) {
-        case DEVICE_GPS:
-          digitalWrite( GPS_EN, LOW );
-          break;
-        case DEVICE_MBUS:
-          digitalWrite( MBUS_EN, LOW );
-          break;
-        case DEVICE_CAMERA:
-          digitalWrite( CAM_EN, LOW );
-          break;
-        default:
-          // Invalid device
-          break;
-      }
-      break;
+      // Disable power to peripheral
+      case CMD_POWER_DISABLE:
+        switch( target ) {
+          case DEVICE_GPS:
+            digitalWrite( GPS_EN, LOW );
+            break;
+          case DEVICE_MBUS:
+            digitalWrite( MBUS_EN, LOW );
+            break;
+          case DEVICE_CAMERA:
+            digitalWrite( CAM_EN, LOW );
+            break;
+          default:
+            // Invalid device
+            break;
+        }
+        break;
 
-    // Reset peripheral device
-    case CMD_RESET_DEVICE:
+      // Reset peripheral device
+      case CMD_RESET_DEVICE:
+        switch( target ) {
+          case DEVICE_GPS:
+            digitalWrite( GPS_EN, LOW );
+            delay( 50 );
+            digitalWrite( GPS_EN, HIGH );
+            break;
+          case DEVICE_MBUS:
+            digitalWrite( MBUS_EN, LOW );
+            delay( 50 );
+            digitalWrite( MBUS_EN, HIGH );
+            break;
+          case DEVICE_CAMERA:
+            digitalWrite( CAM_EN, LOW );
+            delay( 50 );
+            digitalWrite( CAM_EN, HIGH );
+            break;
+          default:
+            // Invalid device
+            break;
+        }
+        break;
+      
+      case CMD_SPI_SELECT:
+        switch( target ) {
+          case DEVICE_CAMERA:
+            digitalWrite( SD_SELECT, HIGH ); // Deselect SD
+            digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
+            digitalWrite( CAM_SELECT, LOW ); // Enable Camera
+            break;
+          
+          case DEVICE_SD:
+            digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
+            digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
+            digitalWrite( SD_SELECT, LOW ); // Select SD
+            break;
+          
+          case DEVICE_LORA:
+            digitalWrite( SD_SELECT, HIGH ); // Deselect SD
+            digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
+            digitalWrite( LORA_SELECT, LOW ); // Select LoRa
+            break;
+
+          default:
+            // Invalid device
+            digitalWrite( SD_SELECT, HIGH ); // Deselect both
+            digitalWrite( LORA_SELECT, HIGH );
+            digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
+            break;
+        }
+        break;
+      
+      case CMD_MBUS_BAUD_RATE:
+        if( target < sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]) ) {
+          uint32_t baudRate = BAUD_RATES[target];
+          mbusSerial.end();
+          mbusSerial.begin( baudRate );
+        }
+        break;
+
+      // Invalid command
+      default:
+        break;
+    }
+  }
+
+  // Special cases for 3-byte commands for register writes
+  if( command == CMD_REGISTER_WRITE && length == 3 ) {
+    uint8_t value = Wire.read();
+
+    switch( target ) {
+      case DEVICE_NONE:
+        TEST_REG_VALUE = value;
+        break;
+      
+      case DEVICE_LORA_TXRX:
+        pinMode( LORA_TXRX, OUTPUT );
+        digitalWrite( LORA_TXRX, value == 0 ? LOW : HIGH );
+        break;
+    }
+    return;
+  }
+
+  // This must be a serial write of some type, so pull the whole frame and forward it.
+  if( command != CMD_SERIAL_WRITE ) {
+    // Invalid command for >2 byte frame, drop the data
+    for( int i = 0; i < length - 2; i++ )
+      Wire.read(); // Discard any remaining bytes
+    return;
+  }
+
+  for( int i = 0; i < length - 2; i++ ) {
+    if( Wire.available() ) {
+      uint8_t value = Wire.read();
       switch( target ) {
-        case DEVICE_GPS:
-          digitalWrite( GPS_EN, LOW );
-          delay( 50 );
-          digitalWrite( GPS_EN, HIGH );
-          break;
         case DEVICE_MBUS:
-          digitalWrite( MBUS_EN, LOW );
-          delay( 50 );
-          digitalWrite( MBUS_EN, HIGH );
-          break;
-        case DEVICE_CAMERA:
-          digitalWrite( CAM_EN, LOW );
-          delay( 50 );
-          digitalWrite( CAM_EN, HIGH );
-          break;
-        default:
-          // Invalid device
-          break;
-      }
-      break;
-    
-    case CMD_SPI_SELECT:
-      switch( target ) {
-        case DEVICE_CAMERA:
-          digitalWrite( SD_SELECT, HIGH ); // Deselect SD
-          digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
-          digitalWrite( CAM_SELECT, LOW ); // Enable Camera
+          mbusSerial.write( value );
+          mbusSerial.flush();
           break;
         
-        case DEVICE_SD:
-          digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
-          digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
-          digitalWrite( SD_SELECT, LOW ); // Select SD
-          break;
-        
-        case DEVICE_LORA:
-          digitalWrite( SD_SELECT, HIGH ); // Deselect SD
-          digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
-          digitalWrite( LORA_SELECT, LOW ); // Select LoRa
-          break;
-        
         default:
-          // Invalid device
-          digitalWrite( SD_SELECT, HIGH ); // Deselect both
-          digitalWrite( LORA_SELECT, HIGH );
-          digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
+          // Invalid device, drop the data
           break;
       }
-      break;
-    
-    case CMD_MBUS_BAUD_RATE:
-      if( target < sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]) ) {
-        uint32_t baudRate = BAUD_RATES[target];
-        mbusSerial.end();
-        mbusSerial.begin( baudRate );
-      }
-      break;
-
-
-    // Invalid command
-    default:
-      break;
+    }
   }
 
 }

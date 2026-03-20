@@ -56,9 +56,7 @@
 
 // Configuration //
 #define RIBBIT_ADDRESS 0x10
-#define RIBBIT_VERSION_STR "1.0"
-#define RIBBIT_VERSION_MAJOR 1
-#define RIBBIT_VERSION_MINOR 0
+#define RIBBIT_VERSION 4
 
 // Common UART Baud Rates
 static const uint32_t BAUD_RATES[] = {
