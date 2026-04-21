@@ -8,9 +8,6 @@
  * port/pin definitions directly here.
  */
 
-#undef _SS_MAX_RX_BUFF
-#define _SS_MAX_RX_BUFF 64 // SoftwareSerial RX buffer size
-
 // Pin Definitions // Citizen Bit Hardware Version 1.0
 #define HOST_IRQ    PIN_PE1
 #define MBUS_RESET  PIN_PE0
@@ -57,23 +54,3 @@
 // Configuration //
 #define RIBBIT_ADDRESS 0x10
 #define RIBBIT_VERSION 4
-
-// Common UART Baud Rates
-static const uint32_t BAUD_RATES[] = {
-    300,
-    600,
-    1200,
-    2400,
-    4800,
-    9600,
-    14400,
-    19200,
-    28800,
-    38400,
-    57600,
-    115200,
-    230400,
-    460800,
-    921600
-};
-static const size_t BAUD_RATES_COUNT = sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]);

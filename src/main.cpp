@@ -1,52 +1,125 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <SoftwareSerial.h>
+#include <avr/wdt.h>
 
 #include "config.h"
 #include "buffer.h"
 
-#define IRQ_NONE   0x00
-#define IRQ_BUTTON 0x01
-#define IRQ_GPS    0x02
-#define IRQ_MBUS   0x04
-#define IRQ_CAMERA 0x08
-#define IRQ_LORA   0x10
+// IRQ masks
+#define IRQ_NONE        0x00
+#define IRQ_BUTTON      0x01
+#define IRQ_GPS         0x02
+#define IRQ_MBUS        0x04
+#define IRQ_MBUS_INT    0x08
+#define IRQ_MBUS_RESET  0x10
+#define IRQ_MBUS_SERIAL 0x20
+#define IRQ_CAMERA      0x40
+#define IRQ_LORA        0x80
 
 // Effectively 'registers' on the host's side.
-#define CMD_INVALID         0x00
-#define CMD_POWER_ENABLE    0x01
-#define CMD_POWER_DISABLE   0x02
-#define CMD_RESET_DEVICE    0x03
-#define CMD_SPI_SELECT      0x04
-#define CMD_MBUS_BAUD_RATE  0x05
-#define CMD_SERIAL_WRITE    0x06
-#define CMD_REGISTER_WRITE  0x07
+#define REG_INVALID             0x00
+#define REG_DEBUG               0x01 // write-only
+#define REG_VERSION             0x01 // read-only
 
-#define DEVICE_NONE      0x00
-#define DEVICE_GPS       0x01
-#define DEVICE_MBUS      0x02
-#define DEVICE_CAMERA    0x03
-#define DEVICE_LORA      0x04
-#define DEVICE_LORA_TXRX 0x05
-#define DEVICE_SD        0x06
-// -- gap -- //
-#define DEVICE_VERSION    0xff
+#define REG_GPS_CONTROL         0x02 // write-only
+#define REG_GPS_STATUS          0x02 // read-only
+
+#define REG_MBUS_CONTROL        0x03 // write-only
+#define REG_MBUS_STATUS         0x03 // read-only
+
+#define REG_CAMERA_CONTROL      0x04 // write-only
+#define REG_CAMERA_STATUS       0x04 // read-only
+
+#define REG_LORA_CONTROL        0x05 // write-only
+#define REG_LORA_STATUS         0x05 // read-only
+
+#define REG_SD_CONTROL          0x06 // write-only
+#define REG_SD_STATUS           0x06 // read-only
+
+#define REG_BUTTONS_STATE       0x07 // read-only, bitmask of button states (1=pressed, 0=released)
+#define REG_BUTTONS_IRQ         0x07 // write-only, bitmask of buttons that should trigger an IRQ when their state changes
+
+#define REG_MBUS_INT_DIGITAL    0x08 // read/write - places the pin into digital IO mode if accessed
+#define REG_MBUS_INT_ANALOG     0x09 // read/write - places the pin into analog mode if accessed, and returns the analog value on read, or sets a PWM value on write
+                                     // Inoperable (invalid state) if interrupts are enabled on this pin.
+
+#define REG_MBUS_RESET_DIGITAL  0x0A // read/write - places the pin into digital IO mode if accessed
+#define REG_MBUS_RESET_ANALOG   0x0B // read/write - places the pin into analog mode if accessed, and returns the analog value on read, or sets a PWM value on write
+                                     // Inoperable (invalid state) if interrupts are enabled on this pin.
+
+#define REG_MBUS_SERIAL_CONFIG       0x0C // Multibyte register: [baud, bits, stop, parity]
+#define REG_MBUS_SERIAL_DATA         0x0D // FIFO buffer for serial data to be sent out, or data received from the host
+#define REG_MBUS_SERIAL_LENGTH       0x0E // Number of bytes in the serial data buffer
+
+#define REG_GPS_DATA            0x0F // FIFO buffer for GPS data
+#define REG_GPS_LENGTH          0x10 // Number of bytes in the GPS data buffer
+
+// ... gap! ...
+
+#define REG_IRQ                 0xFF // read/write - reads return the current IRQ status without clearing it, writes will override the current IRQ status.
+
+// Used to ensure a stable interface to potentially differing Arduino constants across versions and platforms.
+// Note that this must match the lookup table in the firmware
+typedef enum {
+  CONFIG_5N1 = 0x00, // SERIAL_5N1,
+  CONFIG_6N1 = 0x01, // SERIAL_6N1,
+  CONFIG_7N1 = 0x02, // SERIAL_7N1,
+  CONFIG_8N1 = 0x03, // SERIAL_8N1,
+  CONFIG_5N2 = 0x04, // SERIAL_5N2,
+  CONFIG_6N2 = 0x05, // SERIAL_6N2,
+  CONFIG_7N2 = 0x06, // SERIAL_7N2,
+  CONFIG_8N2 = 0x07, // SERIAL_8N2,
+  CONFIG_5E1 = 0x08, // SERIAL_5E1,
+  // even parity
+  CONFIG_6E1 = 0x09, // SERIAL_6E1,
+  CONFIG_7E1 = 0x0A, // SERIAL_7E1,
+  CONFIG_8E1 = 0x0B, // SERIAL_8E1,
+  CONFIG_5E2 = 0x0C, // SERIAL_5E2,
+  CONFIG_6E2 = 0x0D, // SERIAL_6E2,
+  CONFIG_7E2 = 0x0E, // SERIAL_7E2,
+  CONFIG_8E2 = 0x0F, // SERIAL_8E2,
+  CONFIG_5O1 = 0x10, // SERIAL_5O1,
+  // odd parity
+  CONFIG_6O1 = 0x11, // SERIAL_6O1,
+  CONFIG_7O1 = 0x12, // SERIAL_7O1,
+  CONFIG_8O1 = 0x13, // SERIAL_8O1,
+  CONFIG_5O2 = 0x14, // SERIAL_5O2,
+  CONFIG_6O2 = 0x15, // SERIAL_6O2,
+  CONFIG_7O2 = 0x16, // SERIAL_7O2,
+  CONFIG_8O2 = 0x17  // SERIAL_8O2
+} mbus_serial_config_t;
+
+// Used for select mutual exclusion
+#define DEV_NONE    0x00
+#define DEV_MBUS    0x01
+#define DEV_CAMERA  0x02
+#define DEV_LORA    0x03
+#define DEV_SD      0x04
+
 
 // System State (virtual registers)
+static volatile uint8_t rSystemFlags = 0x00;
 static volatile uint8_t rIRQ = 0x00;
 static volatile uint8_t rButtons = 0x00;
+static volatile uint8_t rButtonsIRQMask = 0x00;
 
-SoftwareSerial gpsSerial( GPS_DATA , -1 ); // RX only
-SoftwareSerial mbusSerial( MBUS_RX, MBUS_TX ); // RX and TX
+// Power control state
+static volatile bool fGpsPower = false;
+static volatile bool fMbusPower = false;
+static volatile bool fCameraPower = false;
 
-uint8_t mbusRxStorage[256] = {0};
-uint8_t gpsStorage[256] = {0};
-ByteBuffer mbusRxBuffer;
-ByteBuffer gpsBuffer;
+// Select state for SPI devices (camera, SD, LoRa)
+static volatile uint8_t spiSelectState = DEV_NONE;
 
-static volatile uint8_t TEST_REG_VALUE = 0;
-static volatile uint8_t pending_reg = 0;
-static volatile bool deferred_reg_read = false;
+static HardwareSerial &gpsSerial = Serial;   // USART0 (PD0/PD1)
+static HardwareSerial &mbusSerial = Serial1; // USART1 (PB4/PB3)
+
+static uint8_t mbusRxStorage[256] = {0};
+static uint8_t gpsStorage[256] = {0};
+static ByteBuffer mbusRxBuffer;
+static ByteBuffer gpsBuffer;
+
+static volatile uint8_t register_ptr = 0x00;
 
 // Override any variant-provided initVariant() that might configure pins (e.g., LED_BUILTIN).
 extern "C" void initVariant(void)
@@ -54,11 +127,167 @@ extern "C" void initVariant(void)
   // Intentionally empty: we want full control of all GPIO configuration.
 }
 
-void i2cEvent( int howMany );
-void i2cRequest();
+uint16_t wireReadU16() {
+  if( Wire.available() < 2 )
+    return 0;
+  
+  uint16_t value = Wire.read() << 8; // Read high byte
+  value |= Wire.read(); // Read low byte
+  return value;
+}
+
+uint32_t wireReadU32() {
+  if( Wire.available() < 4 )
+    return 0;
+
+  uint32_t value = (uint32_t)Wire.read() << 24;
+  value |= (uint32_t)Wire.read() << 16;
+  value |= (uint32_t)Wire.read() << 8;
+  value |= (uint32_t)Wire.read();
+  return value;
+}
+
+void i2cRemoteWrite( int howMany );
+void i2cRemoteRead();
+
+typedef void (*isr_callback_t)(void);
+
+struct PinInterruptHandler {
+  isr_callback_t callback;
+  uint8_t mode;
+  uint8_t lastState;
+  bool enabled;
+};
+
+static PinInterruptHandler gPinInterruptHandlers[NUM_DIGITAL_PINS] = {};
+
+static bool pinInterruptShouldFire(uint8_t mode, uint8_t lastState, uint8_t currentState)
+{
+  if( lastState == currentState )
+    return false;
+
+  switch( mode ) {
+    case CHANGE:
+      return true;
+    case RISING:
+      return (lastState == LOW) && (currentState == HIGH);
+    case FALLING:
+      return (lastState == HIGH) && (currentState == LOW);
+    default:
+      return true;
+  }
+}
+
+static void handlePinChangeGroup(uint8_t group)
+{
+  for( uint8_t pin = 0; pin < NUM_DIGITAL_PINS; pin++ ) {
+    PinInterruptHandler &handler = gPinInterruptHandlers[pin];
+    if( !handler.enabled || handler.callback == nullptr )
+      continue;
+
+    volatile uint8_t *pcicr = digitalPinToPCICR(pin);
+    if( pcicr == nullptr || digitalPinToPCICRbit(pin) != group )
+      continue;
+
+    uint8_t bitMask = digitalPinToBitMask(pin);
+    volatile uint8_t *input = portInputRegister(digitalPinToPort(pin));
+    uint8_t currentState = ((*input) & bitMask) ? HIGH : LOW;
+
+    if( pinInterruptShouldFire(handler.mode, handler.lastState, currentState) )
+      handler.callback();
+
+    handler.lastState = currentState;
+  }
+}
+
+// attachInterrupt-like API with fallback to pin change interrupts when needed.
+static bool attachInterruptCompat(uint8_t pin, isr_callback_t callback, int mode)
+{
+  int interruptNumber = digitalPinToInterrupt(pin);
+  if( interruptNumber != NOT_AN_INTERRUPT ) {
+    attachInterrupt(interruptNumber, callback, mode);
+    return true;
+  }
+
+  volatile uint8_t *pcicr = digitalPinToPCICR(pin);
+  volatile uint8_t *pcmsk = digitalPinToPCMSK(pin);
+  if( pcicr == nullptr || pcmsk == nullptr )
+    return false;
+
+  uint8_t bitMask = digitalPinToBitMask(pin);
+  volatile uint8_t *input = portInputRegister(digitalPinToPort(pin));
+
+  gPinInterruptHandlers[pin].callback = callback;
+  gPinInterruptHandlers[pin].mode = (uint8_t)mode;
+  gPinInterruptHandlers[pin].lastState = ((*input) & bitMask) ? HIGH : LOW;
+  gPinInterruptHandlers[pin].enabled = true;
+
+  *pcmsk |= _BV(digitalPinToPCMSKbit(pin));
+  *pcicr |= _BV(digitalPinToPCICRbit(pin));
+
+  return true;
+}
+
+#if defined(PCINT0_vect)
+ISR(PCINT0_vect)
+{
+  handlePinChangeGroup(0);
+}
+#endif
+
+#if defined(PCINT1_vect)
+ISR(PCINT1_vect)
+{
+  handlePinChangeGroup(1);
+}
+#endif
+
+#if defined(PCINT2_vect)
+ISR(PCINT2_vect)
+{
+  handlePinChangeGroup(2);
+}
+#endif
+
+#if defined(PCINT3_vect)
+ISR(PCINT3_vect)
+{
+  handlePinChangeGroup(3);
+}
+#endif
+
+static void setupWatchdog()
+{
+  MCUSR &= (uint8_t)~_BV(WDRF);
+  wdt_disable();
+  wdt_enable( WDTO_8S );
+  wdt_reset();
+}
+
+static void beginGpsRxOnly(uint32_t baud)
+{
+  gpsSerial.begin( baud );
+
+  // Keep USART0 RX enabled on PD0 but release PD1 for SW_5 by disabling TX.
+  UCSR0B &= (uint8_t)~_BV(TXEN0);
+  pinMode( SW_5, INPUT );
+}
+
+void buttonISR() {
+  rIRQ |= IRQ_BUTTON;
+}
 
 void setup() {
-  UCSR0B = 0; // Disable UART0
+  setupWatchdog();
+
+  rSystemFlags = 0x00;
+  rIRQ = 0x00;
+  rButtons = 0x00;
+  rButtonsIRQMask = 0x00;
+  fGpsPower = false;
+  fMbusPower = false;
+  fCameraPower = false;
+  spiSelectState = DEV_NONE;
 
   // Power Control Pins //
   pinMode( MBUS_EN, OUTPUT );
@@ -84,12 +313,19 @@ void setup() {
   pinMode( LORA_TXRX, INPUT );
 
   // Digital IO //
-  pinMode( SW_0, INPUT );
-  pinMode( SW_1, INPUT );
-  pinMode( SW_2, INPUT );
-  pinMode( SW_3, INPUT );
-  pinMode( SW_4, INPUT );
-  pinMode( SW_5, INPUT );
+  pinMode( SW_0, INPUT_PULLUP );
+  pinMode( SW_1, INPUT_PULLUP );
+  pinMode( SW_2, INPUT_PULLUP );
+  pinMode( SW_3, INPUT_PULLUP );
+  pinMode( SW_4, INPUT_PULLUP );
+  pinMode( SW_5, INPUT_PULLUP );
+
+  attachInterruptCompat(SW_0, buttonISR, CHANGE);
+  attachInterruptCompat(SW_1, buttonISR, CHANGE);
+  attachInterruptCompat(SW_2, buttonISR, CHANGE);
+  attachInterruptCompat(SW_3, buttonISR, CHANGE);
+  attachInterruptCompat(SW_4, buttonISR, CHANGE);
+  attachInterruptCompat(SW_5, buttonISR, CHANGE);
 
   // mBus Port Setup //
   pinMode( MBUS_INT, OUTPUT );
@@ -98,350 +334,425 @@ void setup() {
   digitalWrite( MBUS_RESET, LOW ); // ToDo: change to HIGH for normal boards
 
   // GPS Serial Setup //
-  gpsSerial.begin( 9600 );
+  beginGpsRxOnly( 9600 );
   buffer_init( &gpsBuffer, gpsStorage, sizeof(gpsStorage) );
 
   // mBus Serial Setup //
-  mbusSerial.begin( 9600 );
+  mbusSerial.begin( 115200 );
   buffer_init( &mbusRxBuffer, mbusRxStorage, sizeof(mbusRxStorage) );
 
   // I2C Setup //
   Wire.begin( RIBBIT_ADDRESS );
-  Wire.onReceive( i2cEvent );
-  Wire.onRequest( i2cRequest );
+  Wire.onReceive( i2cRemoteWrite );
+  Wire.onRequest( i2cRemoteRead );
+
+  for(int i=0; i<5; i++) {
+    digitalWrite( MBUS_EN, HIGH );
+    delay(100);
+    digitalWrite( MBUS_EN, LOW );
+    delay(100);
+  }
 }
 
 uint8_t oldState = 0;
 void loop() {
-  rButtons = (digitalRead(SW_0) == LOW ? 1 : 0) << 0;
-  rButtons |= (digitalRead(SW_1) == LOW ? 1 : 0) << 1;
-  rButtons |= (digitalRead(SW_2) == LOW ? 1 : 0) << 2;
-  rButtons |= (digitalRead(SW_3) == LOW ? 1 : 0) << 3;
-  rButtons |= (digitalRead(SW_4) == LOW ? 1 : 0) << 4;
-  rButtons |= (digitalRead(SW_5) == LOW ? 1 : 0) << 5;
   
-  // Button state changed, trigger IRQ
-  if( rButtons != oldState ) {
+  // Button state changed, trigger IRQ if we're not IRQ masked
+  /*if( rButtons != oldState ) {
+    bool triggerIRQ = (rButtons & rButtonsIRQMask) != (oldState & rButtonsIRQMask);
     oldState = rButtons;
-    rIRQ |= IRQ_BUTTON;
+
+    if( triggerIRQ )
+      rIRQ |= IRQ_BUTTON;
+  }*/
+
+  if( rIRQ != 0 )
     digitalWrite( HOST_IRQ, LOW ); // Signal interrupt to host
-  }
-
-  if( gpsSerial.available() ) {
-    if( buffer_full( &gpsBuffer ) ) {
-      // Buffer overflow, start dropping data
-      buffer_pop( &gpsBuffer, nullptr );
-    }
-
-    uint8_t gpsByte = gpsSerial.read();
-    buffer_push( &gpsBuffer, gpsByte );
-    
-    // Only signal IRQ when we have a complete line or significant data
-    //if( gpsByte == '\n' || buffer_size( &gpsBuffer ) >= 64 ) {
-      //digitalWrite( MBUS_INT, HIGH );
-      rIRQ |= IRQ_GPS;
-      digitalWrite( HOST_IRQ, LOW ); // Signal interrupt to host
-    //}
-  }
-
-  if( mbusSerial.available() ) {
-    if( buffer_full( &mbusRxBuffer ) ) {
-      // Buffer overflow, start dropping data
-      buffer_pop( &mbusRxBuffer, nullptr );
-    }
-
-    uint8_t mbusByte = mbusSerial.read();
-    buffer_push( &mbusRxBuffer, mbusByte );
-    
-    // Only signal IRQ when we have a complete line or significant data
-    //digitalWrite( MBUS_INT, HIGH );
-    rIRQ |= IRQ_MBUS;
-    digitalWrite( HOST_IRQ, LOW ); // Signal interrupt to host
-  }
-
-  delay(2);
+  else
+    digitalWrite( HOST_IRQ, HIGH ); // Clear interrupt signal if no IRQs pending
 }
 
-void i2cRequest() {
+void serialEvent() {
+  while( gpsSerial.available() ) {
+    uint8_t byte = gpsSerial.read();
+    buffer_push( &gpsBuffer, byte );
 
-  // Handle deferred register read if pending.
-  // This allows us to do pin/register reads in the context of the request.
-  if( deferred_reg_read ) {
-    deferred_reg_read = false;
-    uint8_t value = 0x00;
-    switch( pending_reg ) {
-      case DEVICE_NONE:
-        value = TEST_REG_VALUE;
-        break;
-        
-      case DEVICE_LORA_TXRX:
-        pinMode( LORA_TXRX, INPUT );
-        value = digitalRead( LORA_TXRX );
-        break;
-      
-      case DEVICE_VERSION:
-        value = RIBBIT_VERSION;
-        break;
-    }
+    // Trigger an IRQ for the host to read this data
+    rIRQ |= IRQ_GPS;
+  }
+}
 
-    Wire.write( value );
-    return;
+void serialEvent1() {
+  while( mbusSerial.available() ) {
+    uint8_t byte = mbusSerial.read();
+    buffer_push( &mbusRxBuffer, byte );
+
+    rIRQ |= IRQ_MBUS_SERIAL;
+  }
+}
+
+void spi_select( uint8_t device ) {
+  if( spiSelectState == device )
+    return; // No change
+  
+  switch( device ) {
+
+    // Note: SPI select for MBUS is handled by the Micro:bit, so we just deassert all other devices
+    case DEV_MBUS:
+      digitalWrite( SD_SELECT, HIGH );
+      digitalWrite( LORA_SELECT, HIGH );
+      digitalWrite( CAM_SELECT, HIGH );
+      spiSelectState = DEV_MBUS;
+      break;
+    
+    case DEV_CAMERA:
+      digitalWrite( SD_SELECT, HIGH );
+      digitalWrite( LORA_SELECT, HIGH );
+      digitalWrite( CAM_SELECT, LOW );
+      spiSelectState = DEV_CAMERA;
+      break;
+    
+    case DEV_LORA:
+      digitalWrite( SD_SELECT, HIGH );
+      digitalWrite( CAM_SELECT, HIGH );
+      digitalWrite( LORA_SELECT, LOW );
+      spiSelectState = DEV_LORA;
+
+      break;
+    
+    case DEV_SD:
+      digitalWrite( CAM_SELECT, HIGH );
+      digitalWrite( LORA_SELECT, HIGH );
+      digitalWrite( SD_SELECT, LOW );
+      spiSelectState = DEV_SD;
+      break;
+    
+    default:
+      digitalWrite( SD_SELECT, HIGH );
+      digitalWrite( LORA_SELECT, HIGH );
+      digitalWrite( CAM_SELECT, HIGH );
+      spiSelectState = DEV_NONE;
+      device = DEV_NONE; // Ensure invalid device selections are treated as no device selected
+      break;
   }
 
-  if( rIRQ == IRQ_NONE ) {
-    uint8_t frame[16] = {0};
-    Wire.write( frame, sizeof(frame) );
-    return;
-  }
+  spiSelectState = device;
+}
 
-  // The following sections should be mutually exclusive
-  // and in descending priority order.
-  //
-  // Returned frames should have their header IRQ set to a single
-  // bit option, not a composite!
-  if( (rIRQ & IRQ_BUTTON) == IRQ_BUTTON ) {
-    uint8_t frame[16] = {
-      IRQ_BUTTON,
-      rButtons,
-      0x00
-    }; // Zero pad the remaining bytes
-    Wire.write( frame, sizeof(frame) );
-    rIRQ &= ~IRQ_BUTTON; // Clear button IRQ after read
-  }
-  else if( (rIRQ & IRQ_GPS) == IRQ_GPS ) {
-    uint8_t length = buffer_size( &gpsBuffer );
+void i2cRemoteRead() {
+  uint8_t buffer = 0x00;
 
-    if( length > 14 )
-      length = 14; // Max data length we can send in one frame
+  switch( register_ptr ) {
+    case REG_VERSION:
+      Wire.write( RIBBIT_VERSION );
+      wdt_reset();
+      break;
+    
+    case REG_GPS_STATUS:
+      buffer = fGpsPower ? 0x01 : 0x00;
+      Wire.write( buffer );
+      wdt_reset();
+      break;
 
-    uint8_t frame[16] = {
-      IRQ_GPS,
-      length,
-    }; // Zero pad the remaining bytes
-
-    for( size_t i = 0; i < length; i++ ) {
-      if( buffer_available( &gpsBuffer ) ) {
-        uint8_t value = 0;
-        buffer_pop( &gpsBuffer, &value );
-        frame[i + 2] = value;
-      } else {
-        frame[i + 2] = 0x00; // No more data
+    case REG_MBUS_STATUS:
+      buffer = fMbusPower ? 0x01 : 0x00;
+      buffer |= (spiSelectState == DEV_MBUS) ? 0x02 : 0x00;
+      Wire.write( buffer );
+      wdt_reset();
+      break;
+    
+    case REG_CAMERA_STATUS:
+      buffer = fCameraPower ? 0x01 : 0x00;
+      buffer |= (spiSelectState == DEV_CAMERA) ? 0x02 : 0x00;
+      Wire.write( buffer );
+      wdt_reset();
+      break;
+    
+    case REG_LORA_STATUS:
+      buffer = 0x01; // No power control
+      buffer |= (spiSelectState == DEV_LORA) ? 0x02 : 0x00;
+      Wire.write( buffer );
+      wdt_reset();
+      break;
+    
+    case REG_SD_STATUS:
+      buffer = 0x01; // No power control
+      buffer |= (spiSelectState == DEV_SD) ? 0x02 : 0x00;
+      Wire.write( buffer );
+      wdt_reset();
+      break;
+    
+    case REG_BUTTONS_STATE:
+      rButtons = (digitalRead(SW_0) == LOW ? 1 : 0) << 0;
+      rButtons |= (digitalRead(SW_1) == LOW ? 1 : 0) << 1;
+      rButtons |= (digitalRead(SW_2) == LOW ? 1 : 0) << 2;
+      rButtons |= (digitalRead(SW_3) == LOW ? 1 : 0) << 3;
+      rButtons |= (digitalRead(SW_4) == LOW ? 1 : 0) << 4;
+      rButtons |= (digitalRead(SW_5) == LOW ? 1 : 0) << 5;
+      Wire.write( rButtons );
+      rIRQ &= ~IRQ_BUTTON; // Clear button IRQ on read
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_INT_DIGITAL:
+      pinMode( MBUS_INT, INPUT );
+      Wire.write( digitalRead(MBUS_INT) );
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_INT_ANALOG:
+      pinMode( MBUS_INT, INPUT );
+      {
+        uint16_t value = analogRead( MBUS_INT );
+        uint8_t bytes[2] = {
+          (uint8_t)(value >> 8),
+          (uint8_t)(value & 0xFF)
+        };
+        Wire.write( bytes, sizeof(bytes) );
       }
-    }
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_RESET_DIGITAL:
+      pinMode( MBUS_RESET, INPUT );
+      Wire.write( digitalRead(MBUS_RESET) );
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_RESET_ANALOG:
+      pinMode( MBUS_RESET, INPUT );
+      {
+        uint16_t value = analogRead( MBUS_RESET );
+        uint8_t bytes[2] = {
+          (uint8_t)(value >> 8),
+          (uint8_t)(value & 0xFF)
+        };
+        Wire.write( bytes, sizeof(bytes) );
+      }
+      wdt_reset();
+      break;
 
-    Wire.write( frame, sizeof(frame) );
-
-    // Keep GPS IRQ asserted if more data remains so the host keeps reading.
-    if( buffer_available( &gpsBuffer ) ) {
-      rIRQ |= IRQ_GPS;
-      digitalWrite( HOST_IRQ, LOW );
-      //digitalWrite( MBUS_INT, HIGH ); // Debug
-    } else {
-      rIRQ &= ~IRQ_GPS; // Clear GPS IRQ after read
-    }
-  }
-  else if( (rIRQ & IRQ_MBUS) == IRQ_MBUS ) {
-    uint8_t length = buffer_size( &mbusRxBuffer );
-
-    if( length > 14 )
-      length = 14; // Max data length we can send in one frame
-
-    uint8_t frame[16] = {
-      IRQ_MBUS,
-      length,
-    }; // Zero pad the remaining bytes
-
-    for( size_t i = 0; i < length; i++ ) {
+    case REG_MBUS_SERIAL_CONFIG:
+      Wire.write( 0x00 ); // Todo
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_SERIAL_DATA:
       if( buffer_available( &mbusRxBuffer ) ) {
-        uint8_t value = 0;
-        buffer_pop( &mbusRxBuffer, &value );
-        frame[i + 2] = value;
+        uint8_t data;
+        buffer_pop( &mbusRxBuffer, &data );
+        Wire.write( data );
+
+        if( !buffer_available( &mbusRxBuffer ) )
+          rIRQ &= ~IRQ_MBUS_SERIAL; // Clear MBUS Serial IRQ on read
       } else {
-        frame[i + 2] = 0x00; // No more data
+        Wire.write( 0x00 ); // No data available
       }
-    }
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_SERIAL_LENGTH:
+      Wire.write( buffer_size( &mbusRxBuffer ) );
+      wdt_reset();
+      break;
+    
+    case REG_GPS_DATA:
+      if( buffer_available( &gpsBuffer ) ) {
+        uint8_t data;
+        buffer_pop( &gpsBuffer, &data );
+        Wire.write( data );
 
-    Wire.write( frame, sizeof(frame) );
-
-    // Keep mBus IRQ asserted if more data remains so the host keeps reading.
-    if( buffer_available( &mbusRxBuffer ) ) {
-      rIRQ |= IRQ_MBUS;
-      digitalWrite( HOST_IRQ, LOW );
-      //digitalWrite( MBUS_INT, HIGH );
-    } else {
-      rIRQ &= ~IRQ_MBUS; // Clear mBus IRQ after read
-    }
-  }
-
-  // Only clear the IRQ lines if no other types are pending
-  if( rIRQ == IRQ_NONE ) {
-    digitalWrite( HOST_IRQ, HIGH ); // Clear interrupt signal
-    //digitalWrite( MBUS_INT, LOW ); // Clear mBus interrupt signal
+        if( !buffer_available( &gpsBuffer ) )
+          rIRQ &= ~IRQ_GPS; // Clear GPS IRQ on read
+      } else {
+        Wire.write( 0x00 ); // No data available
+      }
+      wdt_reset();
+      break;
+    
+    case REG_GPS_LENGTH:
+      Wire.write( buffer_size( &gpsBuffer ) );
+      wdt_reset();
+      break;
+    
+    case REG_IRQ:
+      Wire.write( rIRQ );
+      wdt_reset();
+      break;
+    
+    default:
+      Wire.write( 0x00 ); // Default read value for unimplemented registers
+      wdt_reset();
+      break;
   }
 }
 
-void i2cEvent( int length ) {
-  uint8_t command = Wire.read();
+void i2cRemoteWrite( int length ) {
+  register_ptr = Wire.read(); // First byte is always the register address
+  uint8_t buffer = 0x00;
 
-  // 1-byte commands are just a pin read, and we only currently have 1 pin
-  //
-  // This is a little bit of a hack to reuse the device IDs as pin selectors for
-  // single simple read commands, a-la regular registre reads.
-  if( length == 1 ) {
-    pending_reg = command;
-    deferred_reg_read = true;
-    return;
-  }
+  if( length == 1 )
+    return; // No data bytes, just a register pointer update
 
-  // All other commands should have at least 2 bytes (command + target)
-  uint8_t target = Wire.read();
+  if( Wire.available() < 1 )
+    return; // No data byte to read, invalid write
 
-  // 2-byte commands are configuration commands, so handle those first.
-  if( length == 2 ) {
-    switch( command ) {
+  switch( register_ptr ) {
 
-      // Enable power to peripheral
-      case CMD_POWER_ENABLE:
-        switch( target ) {
-          case DEVICE_GPS:
-            digitalWrite( GPS_EN, HIGH );
-            break;
-          case DEVICE_MBUS:
-            digitalWrite( MBUS_EN, HIGH );
-            break;
-          case DEVICE_CAMERA:
-            digitalWrite( CAM_EN, HIGH );
-            break;
-          default:
-            // Invalid device
-            break;
-        }
-        break;
-
-      // Disable power to peripheral
-      case CMD_POWER_DISABLE:
-        switch( target ) {
-          case DEVICE_GPS:
-            digitalWrite( GPS_EN, LOW );
-            break;
-          case DEVICE_MBUS:
-            digitalWrite( MBUS_EN, LOW );
-            break;
-          case DEVICE_CAMERA:
-            digitalWrite( CAM_EN, LOW );
-            break;
-          default:
-            // Invalid device
-            break;
-        }
-        break;
-
-      // Reset peripheral device
-      case CMD_RESET_DEVICE:
-        switch( target ) {
-          case DEVICE_GPS:
-            digitalWrite( GPS_EN, LOW );
-            delay( 50 );
-            digitalWrite( GPS_EN, HIGH );
-            break;
-          case DEVICE_MBUS:
-            digitalWrite( MBUS_EN, LOW );
-            delay( 50 );
-            digitalWrite( MBUS_EN, HIGH );
-            break;
-          case DEVICE_CAMERA:
-            digitalWrite( CAM_EN, LOW );
-            delay( 50 );
-            digitalWrite( CAM_EN, HIGH );
-            break;
-          default:
-            // Invalid device
-            break;
-        }
-        break;
+    // Set any system flags
+    case REG_DEBUG:
+      rSystemFlags = Wire.read();
+      wdt_reset();
+      break;
+    
+    case REG_GPS_CONTROL:
+      buffer = Wire.read();
+      fGpsPower = (buffer & 0x01) != 0;
+      digitalWrite( GPS_EN, fGpsPower ? HIGH : LOW );
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_CONTROL:
+      buffer = Wire.read();
       
-      case CMD_SPI_SELECT:
-        switch( target ) {
-          case DEVICE_CAMERA:
-            digitalWrite( SD_SELECT, HIGH ); // Deselect SD
-            digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
-            digitalWrite( CAM_SELECT, LOW ); // Enable Camera
-            break;
-          
-          case DEVICE_SD:
-            digitalWrite( LORA_SELECT, HIGH ); // Deselect LoRa
-            digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
-            digitalWrite( SD_SELECT, LOW ); // Select SD
-            break;
-          
-          case DEVICE_LORA:
-            digitalWrite( SD_SELECT, HIGH ); // Deselect SD
-            digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
-            digitalWrite( LORA_SELECT, LOW ); // Select LoRa
-            break;
+      // Power state
+      fMbusPower = (buffer & 0x01) != 0;
+      digitalWrite( MBUS_EN, fMbusPower ? HIGH : LOW );
 
-          default:
-            // Invalid device
-            digitalWrite( SD_SELECT, HIGH ); // Deselect both
-            digitalWrite( LORA_SELECT, HIGH );
-            digitalWrite( CAM_SELECT, HIGH ); // Disable Camera
-            break;
-        }
-        break;
+      // SPI select state
+      spi_select( (buffer & 0x02) != 0 ? DEV_MBUS : DEV_NONE );
+
+      wdt_reset();
+      break;
+    
+    case REG_CAMERA_CONTROL:
+      buffer = Wire.read();
+
+      // Power state
+      fCameraPower = (buffer & 0x01) != 0;
+      digitalWrite( CAM_EN, fCameraPower ? HIGH : LOW );
+
+      // SPI select state
+      spi_select( (buffer & 0x02) != 0 ? DEV_CAMERA : DEV_NONE );
+
+      wdt_reset();
+      break;
+    
+    case REG_LORA_CONTROL:
+      buffer = Wire.read();
       
-      case CMD_MBUS_BAUD_RATE:
-        if( target < sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]) ) {
-          uint32_t baudRate = BAUD_RATES[target];
-          mbusSerial.end();
-          mbusSerial.begin( baudRate );
-        }
-        break;
+      // SPI select state
+      spi_select( (buffer & 0x02) != 0 ? DEV_LORA : DEV_NONE );
 
-      // Invalid command
-      default:
-        break;
-    }
-  }
+      wdt_reset();
+      break;
+    
+    case REG_SD_CONTROL:
+      buffer = Wire.read();
 
-  // Special cases for 3-byte commands for register writes
-  if( command == CMD_REGISTER_WRITE && length == 3 ) {
-    uint8_t value = Wire.read();
+      // SPI select state
+      spi_select( (buffer & 0x02) != 0 ? DEV_SD : DEV_NONE );
 
-    switch( target ) {
-      case DEVICE_NONE:
-        TEST_REG_VALUE = value;
-        break;
-      
-      case DEVICE_LORA_TXRX:
-        pinMode( LORA_TXRX, OUTPUT );
-        digitalWrite( LORA_TXRX, value == 0 ? LOW : HIGH );
-        break;
-    }
-    return;
-  }
-
-  // This must be a serial write of some type, so pull the whole frame and forward it.
-  if( command != CMD_SERIAL_WRITE ) {
-    // Invalid command for >2 byte frame, drop the data
-    for( int i = 0; i < length - 2; i++ )
-      Wire.read(); // Discard any remaining bytes
-    return;
-  }
-
-  for( int i = 0; i < length - 2; i++ ) {
-    if( Wire.available() ) {
-      uint8_t value = Wire.read();
-      switch( target ) {
-        case DEVICE_MBUS:
-          mbusSerial.write( value );
-          mbusSerial.flush();
-          break;
-        
-        default:
-          // Invalid device, drop the data
-          break;
+      wdt_reset();
+      break;
+    
+    case REG_BUTTONS_IRQ:
+      rButtonsIRQMask = Wire.read();
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_INT_DIGITAL:
+      pinMode( MBUS_INT, OUTPUT );
+      digitalWrite( MBUS_INT, (Wire.read() & 0x01) != 0 ? HIGH : LOW );
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_INT_ANALOG:
+      {
+        uint16_t value = wireReadU16();
+        pinMode( MBUS_INT, OUTPUT );
+        analogWrite( MBUS_INT, value );
+        wdt_reset();
       }
-    }
-  }
+      break;
+    
+    case REG_MBUS_RESET_DIGITAL:
+      pinMode( MBUS_RESET, OUTPUT );
+      digitalWrite( MBUS_RESET, (Wire.read() & 0x01) != 0 ? HIGH : LOW );
+      wdt_reset();
+      break;
+    
+    case REG_MBUS_RESET_ANALOG:
+      {
+        uint16_t value = wireReadU16();
+        pinMode( MBUS_RESET, OUTPUT );
+        analogWrite( MBUS_RESET, value );
+        wdt_reset();
+      }
+      break;
+    
+    case REG_MBUS_SERIAL_CONFIG:
+      {
+        if( Wire.available() < 5 )
+          break;
 
+        // Baud. bits, stop, parity
+        uint32_t baud = wireReadU32();
+
+        if( baud > 2000000 )
+          baud = 2000000; // Cap baud rate to a reasonable maximum to prevent overflow issues
+
+        uint8_t config = Wire.read();
+        switch( config ) {
+          case CONFIG_5N1: config = SERIAL_5N1; break;
+          case CONFIG_6N1: config = SERIAL_6N1; break;
+          case CONFIG_7N1: config = SERIAL_7N1; break;
+          case CONFIG_8N1: config = SERIAL_8N1; break;
+          case CONFIG_5N2: config = SERIAL_5N2; break;
+          case CONFIG_6N2: config = SERIAL_6N2; break;
+          case CONFIG_7N2: config = SERIAL_7N2; break;
+          case CONFIG_8N2: config = SERIAL_8N2; break;
+          case CONFIG_5E1: config = SERIAL_5E1; break;
+          case CONFIG_6E1: config = SERIAL_6E1; break;
+          case CONFIG_7E1: config = SERIAL_7E1; break;
+          case CONFIG_8E1: config = SERIAL_8E1; break;
+          case CONFIG_5E2: config = SERIAL_5E2; break;
+          case CONFIG_6E2: config = SERIAL_6E2; break;
+          case CONFIG_7E2: config = SERIAL_7E2; break;
+          case CONFIG_8E2: config = SERIAL_8E2; break;
+          case CONFIG_5O1: config = SERIAL_5O1; break;
+          case CONFIG_6O1: config = SERIAL_6O1; break;
+          case CONFIG_7O1: config = SERIAL_7O1; break;
+          case CONFIG_8O1: config = SERIAL_8O1; break;
+          case CONFIG_5O2: config = SERIAL_5O2; break;
+          case CONFIG_6O2: config = SERIAL_6O2; break;
+          case CONFIG_7O2: config = SERIAL_7O2; break;
+          case CONFIG_8O2: config = SERIAL_8O2; break;
+
+          default:
+            config = SERIAL_8N1; // Default to 8N1 if invalid config value provided
+        }
+        mbusSerial.end();
+        mbusSerial.begin( baud, (mbus_serial_config_t)config );
+        wdt_reset();
+      }
+      break;
+    
+    case REG_MBUS_SERIAL_DATA:
+      while( Wire.available() ) {
+        wdt_reset();
+        mbusSerial.write( Wire.read() );
+      }
+      break;
+    
+    case REG_IRQ:
+      //rIRQ = Wire.read();
+      wdt_reset();
+      break;
+    
+    default:
+      // Ignore writes to unimplemented/invalid registers
+      Wire.read(); // Still need to read the data byte(s) to clear them from the I2C buffer, even if we ignore them
+      break;
+  }
 }
