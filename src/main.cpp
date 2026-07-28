@@ -5,6 +5,10 @@
 #include "config.h"
 #include "buffer.h"
 
+// Debug Flags
+#define DEBUG_FLAG_NONE 0x00
+#define DEBUG_FLAG_I2C_TRAFFIC 0x01
+
 // IRQ masks
 #define IRQ_NONE        0x00
 #define IRQ_BUTTON      0x01
@@ -56,6 +60,7 @@
 
 // ... gap! ...
 
+#define REG_SEQUENCE            0xFE // Incrementing value that the host can use to detect missed updates and reboots
 #define REG_IRQ                 0xFF // read/write - reads return the current IRQ status without clearing it, writes will override the current IRQ status.
 
 // Used to ensure a stable interface to potentially differing Arduino constants across versions and platforms.
@@ -98,7 +103,8 @@ typedef enum {
 
 
 // System State (virtual registers)
-static volatile uint8_t rSystemFlags = 0x00;
+static volatile uint8_t rSequence = 0x00;
+static volatile uint8_t rSystemFlags = DEBUG_FLAG_NONE;
 static volatile uint8_t rIRQ = 0x00;
 static volatile uint8_t rButtons = 0x00;
 static volatile uint8_t rButtonsIRQMask = 0x00;
@@ -277,9 +283,22 @@ void buttonISR() {
   rIRQ |= IRQ_BUTTON;
 }
 
+static void setDebug( uint8_t led, bool state ) {
+  if( led == 0 ) {
+    #if defined(DEBUG_LED_A)
+      digitalWrite( DEBUG_LED_A, !state );
+    #endif
+  } else if( led == 1 ) {
+    #if defined(DEBUG_LED_B)
+      digitalWrite( DEBUG_LED_B, !state );
+    #endif
+  }
+}
+
 void setup() {
   setupWatchdog();
 
+  rSequence = 0x00;
   rSystemFlags = 0x00;
   rIRQ = 0x00;
   rButtons = 0x00;
@@ -288,6 +307,13 @@ void setup() {
   fMbusPower = false;
   fCameraPower = false;
   spiSelectState = DEV_NONE;
+
+  #if defined(DEBUG_LED_A) && defined(DEBUG_LED_B)
+    pinMode( DEBUG_LED_A, OUTPUT );
+    pinMode( DEBUG_LED_B, OUTPUT );
+  #endif
+  setDebug( 0, HIGH );
+  setDebug( 1, HIGH );
 
   // Power Control Pins //
   pinMode( MBUS_EN, OUTPUT );
@@ -308,6 +334,9 @@ void setup() {
 
   pinMode( LORA_SELECT, OUTPUT );
   digitalWrite( LORA_SELECT, HIGH );
+
+  pinMode( CAM_SELECT, OUTPUT );
+  digitalWrite( CAM_SELECT, HIGH );
 
   // Bidirectional TXRX pin for LoRa, default to input (RX mode, high-z)
   pinMode( LORA_TXRX, INPUT );
@@ -346,12 +375,11 @@ void setup() {
   Wire.onReceive( i2cRemoteWrite );
   Wire.onRequest( i2cRemoteRead );
 
-  for(int i=0; i<5; i++) {
-    digitalWrite( MBUS_EN, HIGH );
-    delay(100);
-    digitalWrite( MBUS_EN, LOW );
-    delay(100);
-  }
+  delay(100);
+  #if defined(DEBUG_LED_B)
+    setDebug( 0, LOW );
+    setDebug( 1, LOW );
+  #endif
 }
 
 uint8_t oldState = 0;
@@ -427,6 +455,7 @@ void spi_select( uint8_t device ) {
       spiSelectState = DEV_SD;
       break;
     
+    // Also handles DEV_NONE along with any invalid device selections
     default:
       digitalWrite( SD_SELECT, HIGH );
       digitalWrite( LORA_SELECT, HIGH );
@@ -441,6 +470,9 @@ void spi_select( uint8_t device ) {
 
 void i2cRemoteRead() {
   uint8_t buffer = 0x00;
+
+  if( (rSystemFlags & DEBUG_FLAG_I2C_TRAFFIC) == DEBUG_FLAG_I2C_TRAFFIC )
+    setDebug( 1, HIGH );
 
   switch( register_ptr ) {
     case REG_VERSION:
@@ -575,6 +607,11 @@ void i2cRemoteRead() {
       wdt_reset();
       break;
     
+    case REG_SEQUENCE:
+      Wire.write( rSequence );
+      wdt_reset();
+      break;
+    
     case REG_IRQ:
       Wire.write( rIRQ );
       wdt_reset();
@@ -585,9 +622,19 @@ void i2cRemoteRead() {
       wdt_reset();
       break;
   }
+
+  if( (rSystemFlags & DEBUG_FLAG_I2C_TRAFFIC) == DEBUG_FLAG_I2C_TRAFFIC )
+    setDebug( 1, LOW );
+
+  rSequence++;
+  if( rSequence == 0x00 )
+    rSequence = 0x01; // Ensure sequence number never returns to 0 to avoid confusion with power-on state
 }
 
 void i2cRemoteWrite( int length ) {
+  if( (rSystemFlags & DEBUG_FLAG_I2C_TRAFFIC) == DEBUG_FLAG_I2C_TRAFFIC )
+    setDebug( 0, HIGH );
+  
   register_ptr = Wire.read(); // First byte is always the register address
   uint8_t buffer = 0x00;
 
@@ -755,4 +802,11 @@ void i2cRemoteWrite( int length ) {
       Wire.read(); // Still need to read the data byte(s) to clear them from the I2C buffer, even if we ignore them
       break;
   }
+
+  if( (rSystemFlags & DEBUG_FLAG_I2C_TRAFFIC) == DEBUG_FLAG_I2C_TRAFFIC )
+    setDebug( 0, LOW );
+
+  rSequence++;
+  if( rSequence == 0x00 )
+    rSequence = 0x01; // Ensure sequence number never returns to 0 to avoid confusion with power-on state
 }

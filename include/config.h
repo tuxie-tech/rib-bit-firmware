@@ -8,9 +8,23 @@
  * port/pin definitions directly here.
  */
 
+// Configuration //
+#define RIBBIT_ADDRESS 0x10
+#define RIBBIT_VERSION 4
+
+#if RIBBIT_VERSION > 3
+    #define DEBUG_LED_A PIN_PE0
+    #define DEBUG_LED_B PIN_PE1
+#endif
+
 // Pin Definitions // Citizen Bit Hardware Version 1.0
-#define HOST_IRQ    PIN_PE1
-#define MBUS_RESET  PIN_PE0
+#if RIBBIT_VERSION > 3
+    #define HOST_IRQ    PIN_PB7
+    #define MBUS_RESET  PIN_PB6
+#else
+    #define HOST_IRQ    PIN_PE1
+    #define MBUS_RESET  PIN_PE0
+#endif
 #define GPS_RESET   PIN_PE2
 #define CAM_SELECT  PIN_PE3
 
@@ -49,8 +63,3 @@
 // I2C (PC4/PC5 => A4/A5)
 #define SYS_SDA PIN_PC4 // PC4
 #define SYS_SCL PIN_PC5 // PC5
-
-
-// Configuration //
-#define RIBBIT_ADDRESS 0x10
-#define RIBBIT_VERSION 4
