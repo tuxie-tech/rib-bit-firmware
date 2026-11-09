@@ -425,7 +425,7 @@ void spi_select( uint8_t device ) {
   
   switch( device ) {
 
-    // Note: SPI select for MBUS is handled by the Micro:bit, so we just deassert all other devices
+    // Note: SPI select for MBUS is handled by the micro:bit, so we just deassert all other devices
     case DEV_MBUS:
       digitalWrite( SD_SELECT, HIGH );
       digitalWrite( LORA_SELECT, HIGH );
